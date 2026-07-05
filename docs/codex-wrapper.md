@@ -1,14 +1,15 @@
 # Codex Wrapper Notes
 
-This branch preserves AntonLT's Codex/Graphify setup from the installed
-`graphifyy==0.8.49` baseline.
+This branch preserves AntonLT's Codex/Graphify setup while tracking the latest
+published `graphifyy` package release.
 
 ## Baseline
 
 - Upstream: `https://github.com/Graphify-Labs/graphify`
 - Fork: `https://github.com/AntonLT/graphify`
 - Branch: `anton/codex-graphify-wrapper`
-- Baseline tag: `v0.8.49`
+- Original preserved baseline: `v0.8.49`
+- Current package baseline: `v0.9.6`
 - Installed command: `/Users/anton/.local/bin/graphify`
 - Installed package env:
   `/Users/anton/.local/share/uv/tools/graphifyy`
