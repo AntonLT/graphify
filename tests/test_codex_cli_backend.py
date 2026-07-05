@@ -47,8 +47,8 @@ def _fake_codex_run(argv, **kwargs):
 def test_codex_cli_backend_registered_with_defaults():
     assert "codex-cli" in llm.BACKENDS
     cfg = llm.BACKENDS["codex-cli"]
-    assert cfg["default_model"] == "gpt-5.5"
-    assert cfg["reasoning_effort"] == "medium"
+    assert cfg["default_model"] == "gpt-5.3-codex-spark"
+    assert cfg["reasoning_effort"] == "xhigh"
     assert llm.estimate_cost("codex-cli", 1_000_000, 1_000_000) == 0.0
 
 
@@ -77,8 +77,8 @@ def test_call_codex_cli_passes_default_model_and_reasoning(monkeypatch):
 
     argv = run.call_args.args[0]
     assert argv[:2] == ["codex", "exec"]
-    assert argv[argv.index("--model") + 1] == "gpt-5.5"
-    assert "model_reasoning_effort=\"medium\"" in argv
+    assert argv[argv.index("--model") + 1] == "gpt-5.3-codex-spark"
+    assert "model_reasoning_effort=\"xhigh\"" in argv
     assert "--output-last-message" in argv
     assert argv[-1] == "-"
     sent = run.call_args.kwargs["input"]
@@ -86,7 +86,7 @@ def test_call_codex_cli_passes_default_model_and_reasoning(monkeypatch):
     assert "output ONLY the JSON object" in sent
     assert "UNIQUE_SOURCE_MARKER" in sent
     assert result["nodes"] == _RESULT["nodes"]
-    assert result["model"] == "gpt-5.5"
+    assert result["model"] == "gpt-5.3-codex-spark"
 
 
 def test_call_codex_cli_env_overrides_model_and_reasoning(monkeypatch):
@@ -131,8 +131,8 @@ def test_extract_corpus_parallel_codex_cli_progress_and_serial(monkeypatch, tmp_
     )
 
     out = capsys.readouterr().out
-    assert "[graphify codex-cli] model: gpt-5.5" in out
-    assert "[graphify codex-cli] reasoning: medium" in out
+    assert "[graphify codex-cli] model: gpt-5.3-codex-spark" in out
+    assert "[graphify codex-cli] reasoning: xhigh" in out
     assert "[graphify codex-cli] chunks: 2, concurrency: 1" in out
     assert "[graphify codex-cli] chunk 1/2: 1 files," in out
     assert "[graphify codex-cli] chunk 1/2 done: 1 nodes, 0 edges," in out

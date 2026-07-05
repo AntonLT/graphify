@@ -175,9 +175,9 @@ BACKENDS: dict[str, dict] = {
     "codex-cli": {
         # Routes through the locally-installed `codex` CLI using the user's
         # Codex auth/config instead of an API key.
-        "default_model": "gpt-5.5",
+        "default_model": "gpt-5.3-codex-spark",
         "model_env_key": "GRAPHIFY_CODEX_CLI_MODEL",
-        "reasoning_effort": os.environ.get("GRAPHIFY_CODEX_CLI_REASONING", "medium"),
+        "reasoning_effort": os.environ.get("GRAPHIFY_CODEX_CLI_REASONING", "xhigh"),
         "pricing": {"input": 0.0, "output": 0.0},
         "temperature": 0,
         "max_tokens": 16384,
