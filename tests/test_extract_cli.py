@@ -123,6 +123,99 @@ def test_extract_succeeds_when_at_least_one_chunk_completes(
     )
 
 
+def test_extract_auto_selects_codex_cli_without_api_key(
+    monkeypatch, tmp_path, capsys
+):
+    """When docs need semantic extraction and no API-key backend is configured,
+    a local Codex CLI should be the default backend."""
+    corpus = _make_corpus(tmp_path)
+    out_dir = tmp_path / "out"
+    _clear_backend_keys(monkeypatch)
+
+    seen = {}
+
+    def _one_chunk_succeeded(paths, **kwargs):
+        seen["backend"] = kwargs.get("backend")
+        on_chunk = kwargs.get("on_chunk_done")
+        if on_chunk:
+            on_chunk(0, 1, {"nodes": [], "edges": [], "hyperedges": []})
+        return {
+            "nodes": [],
+            "edges": [],
+            "hyperedges": [],
+            "input_tokens": 100,
+            "output_tokens": 50,
+        }
+
+    monkeypatch.setattr("shutil.which", lambda name: "/fake/bin/codex" if name == "codex" else None)
+    monkeypatch.setattr("graphify.llm.extract_corpus_parallel", _one_chunk_succeeded)
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.setattr(
+        mainmod.sys,
+        "argv",
+        ["graphify", "extract", str(corpus), "--out", str(out_dir)],
+    )
+
+    try:
+        mainmod.main()
+    except SystemExit as exc:
+        assert exc.code in (None, 0), f"unexpected exit code {exc.code}"
+
+    out = capsys.readouterr().out
+    assert seen["backend"] == "codex-cli"
+    assert "via codex-cli" in out
+    assert (out_dir / "graphify-out" / "graph.json").exists()
+
+
+def test_extract_accepts_explicit_codex_cli_without_api_key(
+    monkeypatch, tmp_path
+):
+    """`--backend codex-cli` should be allowed without API keys when `codex`
+    exists on PATH."""
+    corpus = _make_corpus(tmp_path)
+    out_dir = tmp_path / "out"
+    _clear_backend_keys(monkeypatch)
+
+    def _one_chunk_succeeded(paths, **kwargs):
+        on_chunk = kwargs.get("on_chunk_done")
+        if on_chunk:
+            on_chunk(0, 1, {"nodes": [], "edges": [], "hyperedges": []})
+        return {
+            "nodes": [],
+            "edges": [],
+            "hyperedges": [],
+            "input_tokens": 100,
+            "output_tokens": 50,
+        }
+
+    monkeypatch.setattr("shutil.which", lambda name: "/fake/bin/codex" if name == "codex" else None)
+    monkeypatch.setattr("graphify.llm.extract_corpus_parallel", _one_chunk_succeeded)
+    monkeypatch.setattr(mainmod, "_check_skill_version", lambda _: None)
+    monkeypatch.setattr(
+        mainmod.sys,
+        "argv",
+        ["graphify", "extract", str(corpus), "--backend", "codex-cli",
+         "--out", str(out_dir)],
+    )
+
+    try:
+        mainmod.main()
+    except SystemExit as exc:
+        assert exc.code in (None, 0), f"unexpected exit code {exc.code}"
+
+    assert (out_dir / "graphify-out" / "graph.json").exists()
+
+
+def test_extract_usage_mentions_codex_cli(monkeypatch, capsys):
+    monkeypatch.setattr(mainmod.sys, "argv", ["graphify", "extract"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        mainmod.main()
+
+    assert exc_info.value.code == 1
+    assert "codex-cli" in capsys.readouterr().err
+
+
 def _code_only_corpus(tmp_path):
     """A corpus with only code — no docs/papers/images."""
     (tmp_path / "auth.py").write_text(

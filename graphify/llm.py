@@ -172,6 +172,17 @@ BACKENDS: dict[str, dict] = {
         # CLI's Read tool rather than as inline base64 (see `_call_claude_cli`).
         "vision": True,
     },
+    "codex-cli": {
+        # Routes through the locally-installed `codex` CLI using the user's
+        # Codex auth/config instead of an API key.
+        "default_model": "gpt-5.5",
+        "model_env_key": "GRAPHIFY_CODEX_CLI_MODEL",
+        "reasoning_effort": os.environ.get("GRAPHIFY_CODEX_CLI_REASONING", "medium"),
+        "pricing": {"input": 0.0, "output": 0.0},
+        "temperature": 0,
+        "max_tokens": 16384,
+        "vision": True,
+    },
 }
 
 
@@ -569,7 +580,7 @@ _MAX_IMAGES_PER_CHUNK = 20
 # Backends that read an image by file path (claude-cli's Read tool)
 # instead of inlining base64. They open the file themselves and downsample as
 # needed, so `_MAX_IMAGE_BYTES` does not apply and the bytes never need loading.
-_PATH_IMAGE_BACKENDS = {"claude-cli"}
+_PATH_IMAGE_BACKENDS = {"claude-cli", "codex-cli"}
 
 
 @dataclass
@@ -1271,6 +1282,86 @@ def _call_claude_cli(user_message: str, max_tokens: int = 8192, *, deep_mode: bo
     return result
 
 
+def _run_codex_cli_prompt(prompt: str, *, model: str | None = None, images: list[_ImageRef] | None = None) -> tuple[str, str]:
+    """Run `codex exec` and return its final assistant message plus model."""
+    import shutil
+    import subprocess
+    import tempfile
+
+    if shutil.which("codex") is None:
+        raise RuntimeError(
+            "Codex CLI not found on $PATH. Install Codex CLI and run `codex` once to authenticate."
+        )
+
+    cfg = BACKENDS["codex-cli"]
+    model = model or _default_model_for_backend("codex-cli")
+    reasoning = os.environ.get("GRAPHIFY_CODEX_CLI_REASONING", cfg.get("reasoning_effort", "medium")).strip() or "medium"
+
+    with tempfile.NamedTemporaryFile("w+", encoding="utf-8", delete=False) as out:
+        out_path = out.name
+    try:
+        cli_args = [
+            "codex", "exec",
+            "--model", model,
+            "-c", f'model_reasoning_effort="{reasoning}"',
+            "--output-last-message", out_path,
+            *[arg for r in (images or []) for arg in ("--image", str(r.path))],
+            "-",
+        ]
+        proc = subprocess.run(
+            cli_args,
+            input=prompt,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=_resolve_api_timeout(),
+            check=False,
+            **_no_window_kwargs(),
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"codex exec exited {proc.returncode}: {proc.stderr.strip()[:500]}"
+            )
+        raw_content = Path(out_path).read_text(encoding="utf-8", errors="replace")
+    finally:
+        try:
+            Path(out_path).unlink()
+        except OSError:
+            pass
+    return raw_content, model
+
+
+def _call_codex_cli(user_message: str, max_tokens: int = 8192, *, deep_mode: bool = False, images: list[_ImageRef] | None = None, model: str | None = None) -> dict:
+    """Call Codex CLI (`codex exec`) through the user's local Codex auth/config."""
+    if images:
+        user_message = _with_image_notes(user_message, images, with_paths=True)
+
+    combined_message = (
+        _extraction_system(deep=deep_mode)
+        + "\n\n---\n"
+        + "Now extract the knowledge graph from the following source file(s) "
+        + "and output ONLY the JSON object described above. No prose, no "
+        + "preamble, no markdown fences.\n\n"
+        + user_message
+    )
+    raw_content, model = _run_codex_cli_prompt(combined_message, model=model, images=images)
+
+    result = _parse_llm_json(raw_content or "{}")
+    result["input_tokens"] = int(result.get("input_tokens", 0) or 0)
+    result["output_tokens"] = int(result.get("output_tokens", 0) or 0)
+    result["model"] = model
+    result["finish_reason"] = "stop"
+    if _response_is_hollow(raw_content, result):
+        print(
+            "[graphify] codex-cli returned a hollow response; treating as "
+            "truncation so adaptive retry can bisect the chunk.",
+            file=sys.stderr,
+        )
+        result["finish_reason"] = "length"
+    return result
+
+
 def _azure_client(api_key: str, endpoint: str):
     """Construct an AzureOpenAI client with env-driven api_version and timeout."""
     try:
@@ -1427,7 +1518,7 @@ def extract_files_direct(
             file=sys.stderr,
         )
         key = "ollama"
-    if not key and backend not in ("bedrock", "claude-cli"):
+    if not key and backend not in ("bedrock", "claude-cli", "codex-cli"):
         raise ValueError(
             f"No API key for backend '{backend}'. "
             f"Set {_format_backend_env_keys(backend)} or pass api_key=."
@@ -1440,7 +1531,7 @@ def extract_files_direct(
     user_msg = _read_files(text_files, root)
     vision = _backend_supports_vision(backend)
     # Only base64 (inline) vision backends need the bytes loaded + size-capped;
-    # path-based backends (claude-cli) and non-vision backends do not.
+    # path-based backends (claude-cli/codex-cli) and non-vision backends do not.
     read_bytes = vision and backend not in _PATH_IMAGE_BACKENDS
     image_refs = _build_image_refs(image_files, root, read_bytes=read_bytes) if image_files else []
     if image_refs and not vision:
@@ -1451,6 +1542,8 @@ def extract_files_direct(
         return _call_claude(key, mdl, user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs)
     if backend == "claude-cli":
         return _call_claude_cli(user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs)
+    if backend == "codex-cli":
+        return _call_codex_cli(user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs, model=mdl)
     if backend == "bedrock":
         return _call_bedrock(mdl, user_msg, max_tokens=max_out, deep_mode=deep_mode, images=image_refs)
     if backend == "azure":
@@ -1871,11 +1964,29 @@ def extract_corpus_parallel(
     # over session state. Force serial unless the user explicitly opts in.
     if backend == "claude-cli" and os.environ.get("GRAPHIFY_CLAUDE_CLI_PARALLEL", "").strip() != "1":
         max_concurrency = 1
+    if backend == "codex-cli" and os.environ.get("GRAPHIFY_CODEX_CLI_PARALLEL", "").strip() != "1":
+        max_concurrency = 1
     workers = max(1, min(max_concurrency, total))
+    if backend == "codex-cli":
+        cfg = BACKENDS["codex-cli"]
+        print(f"[graphify codex-cli] model: {model or _default_model_for_backend('codex-cli')}", flush=True)
+        print(
+            "[graphify codex-cli] reasoning: "
+            f"{os.environ.get('GRAPHIFY_CODEX_CLI_REASONING', cfg.get('reasoning_effort', 'medium'))}",
+            flush=True,
+        )
+        print(f"[graphify codex-cli] chunks: {total}, concurrency: {workers}", flush=True)
     if workers == 1:
         # Avoid thread pool overhead for single-worker runs (and keep
         # callback ordering identical to the pre-refactor sequential path).
         for idx, chunk in enumerate(chunks):
+            if backend == "codex-cli":
+                est = sum(_estimate_file_tokens(unit) for unit in chunk)
+                print(
+                    f"[graphify codex-cli] chunk {idx + 1}/{total}: "
+                    f"{len(chunk)} files, ~{est:,} tokens",
+                    flush=True,
+                )
             _, result, exc = _run_one(idx, chunk)
             if exc is not None:
                 print(f"[graphify] chunk {idx + 1}/{total} failed: {exc}", file=sys.stderr)
@@ -1883,6 +1994,14 @@ def extract_corpus_parallel(
                 continue
             assert result is not None
             _merge_into(merged, result)
+            if backend == "codex-cli":
+                print(
+                    f"[graphify codex-cli] chunk {idx + 1}/{total} done: "
+                    f"{len(result.get('nodes', []))} nodes, "
+                    f"{len(result.get('edges', []))} edges, "
+                    f"{result.get('elapsed_seconds', 0)}s",
+                    flush=True,
+                )
             if callable(on_chunk_done):
                 on_chunk_done(idx, total, result)
     else:
@@ -1959,7 +2078,7 @@ def _call_llm(
         ollama_url = os.environ.get("OLLAMA_BASE_URL", cfg.get("base_url", ""))
         _validate_ollama_base_url(ollama_url)
         key = "ollama"
-    if not key and backend not in ("bedrock", "claude-cli"):
+    if not key and backend not in ("bedrock", "claude-cli", "codex-cli"):
         raise ValueError(
             f"No API key for backend '{backend}'. Set {_format_backend_env_keys(backend)}."
         )
@@ -2010,6 +2129,10 @@ def _call_llm(
             raise RuntimeError(f"claude -p exited {proc.returncode}: {proc.stderr.strip()[:500]}")
         envelope = _claude_cli_envelope(proc.stdout)
         return envelope.get("result", "")
+
+    if backend == "codex-cli":
+        raw, _ = _run_codex_cli_prompt(prompt, model=mdl)
+        return raw
 
 
     if backend == "bedrock":
@@ -2166,7 +2289,7 @@ def _validate_ollama_base_url(url: str, *, warn: bool = True) -> None:
 def detect_backend() -> str | None:
     """Return the name of whichever backend has an API key set, or None.
 
-    Priority: gemini → kimi → claude → openai → deepseek → azure → bedrock → ollama (last, opt-in).
+    Priority: gemini → kimi → claude → openai → deepseek → azure → bedrock → codex-cli → ollama (last, opt-in).
 
     Ollama is intentionally checked LAST so a paid API key (Anthropic/OpenAI/etc.)
     is never silently shadowed by an incidental OLLAMA_BASE_URL in the environment
@@ -2181,12 +2304,18 @@ def detect_backend() -> str | None:
         return "azure"
     if os.environ.get("AWS_PROFILE") or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION"):
         return "bedrock"
+    try:
+        import shutil
+        if shutil.which("codex"):
+            return "codex-cli"
+    except Exception:
+        pass
     ollama_url = os.environ.get("OLLAMA_BASE_URL")
     if ollama_url:
         _validate_ollama_base_url(ollama_url)
         return "ollama"
     for name in BACKENDS:
-        if name not in ("gemini", "kimi", "claude", "openai", "deepseek", "azure", "bedrock", "ollama", "claude-cli"):
+        if name not in ("gemini", "kimi", "claude", "openai", "deepseek", "azure", "bedrock", "ollama", "claude-cli", "codex-cli"):
             if _get_backend_api_key(name):
                 return name
     return None
@@ -2364,12 +2493,13 @@ def label_communities(
 
     # Mirror extract_corpus_parallel's backend guards: Ollama serves one request at
     # a time per loaded model (parallel batches cause VRAM pressure and hollow
-    # replies, #798) and claude-cli shells out to a single Claude Code session that
-    # parallel subprocesses corrupt. Force serial for these unless the user opts in
-    # via the same env switches.
+    # replies, #798) and CLI backends shell out to local agent sessions that
+    # parallel subprocesses can corrupt. Force serial unless the user opts in.
     if backend == "ollama" and os.environ.get("GRAPHIFY_OLLAMA_PARALLEL", "").strip() != "1":
         max_concurrency = 1
     if backend == "claude-cli" and os.environ.get("GRAPHIFY_CLAUDE_CLI_PARALLEL", "").strip() != "1":
+        max_concurrency = 1
+    if backend == "codex-cli" and os.environ.get("GRAPHIFY_CODEX_CLI_PARALLEL", "").strip() != "1":
         max_concurrency = 1
     workers = max(1, min(max_concurrency, n_batches))
 
