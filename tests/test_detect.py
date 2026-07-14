@@ -1,3 +1,4 @@
+import os
 import unicodedata
 from pathlib import Path
 from graphify.detect import classify_file, count_words, detect, detect_incremental, save_manifest, FileType, _looks_like_paper, _is_ignored, _load_graphifyignore, _is_sensitive
@@ -224,6 +225,86 @@ def test_graphifyignore_at_git_root_is_included(tmp_path):
     assert any("main.py" in f for f in code_files)
     assert not any("vendor" in f for f in code_files)
     assert result["graphifyignore_patterns"] == 1
+
+
+def test_gitignore_nested_below_root_excludes_file(tmp_path):
+    """A .gitignore in a subdirectory below the scan root is honored too (#1206).
+
+    Previously only the scan root and its ancestors were read, so a
+    .gitignore sitting inside e.g. vendor/sub/ was silently skipped.
+    """
+    (tmp_path / ".gitignore").write_text("*.log\n")
+    sub = tmp_path / "vendor" / "sub"
+    sub.mkdir(parents=True)
+    (sub / ".gitignore").write_text("secret.txt\n")
+    (tmp_path / "root.py").write_text("x = 1")
+    (tmp_path / "root.log").write_text("noise")
+    (sub / "keep.py").write_text("y = 2")
+    (sub / "secret.txt").write_text("shh")
+
+    result = detect(tmp_path)
+    code_files = result["files"]["code"]
+    assert any("root.py" in f for f in code_files)
+    assert any("keep.py" in f for f in code_files)
+    assert not any("root.log" in f for f in code_files)
+    assert not any("secret.txt" in f for f in code_files)
+    assert result["graphifyignore_patterns"] == 2
+
+
+def test_gitignore_nested_below_root_prunes_whole_directory(tmp_path):
+    """A nested .gitignore excluding a directory prevents descending into it."""
+    sub = tmp_path / "vendor" / "sub"
+    sub.mkdir(parents=True)
+    (sub / ".gitignore").write_text("build/\n")
+    build = sub / "build"
+    build.mkdir()
+    (build / "generated.py").write_text("x = 1")
+    (sub / "keep.py").write_text("y = 2")
+
+    result = detect(tmp_path)
+    code_files = result["files"]["code"]
+    assert any("keep.py" in f for f in code_files)
+    assert not any("generated.py" in f for f in code_files)
+
+
+def test_gitignore_nested_negation_overrides_broader_root_rule(tmp_path):
+    """A closer (nested) .gitignore's `!` re-include wins over a root exclude,
+    matching git's closer-file-wins precedence. Uses .py so classification lands
+    in the deterministic `code` bucket."""
+    (tmp_path / ".gitignore").write_text("*.py\n")
+    sub = tmp_path / "vendor" / "sub"
+    sub.mkdir(parents=True)
+    (sub / ".gitignore").write_text("!important.py\n")
+    (tmp_path / "root.py").write_text("a = 1")
+    (sub / "important.py").write_text("b = 1")
+    (sub / "other.py").write_text("c = 1")
+
+    result = detect(tmp_path)
+    code = result["files"]["code"]
+    # nested `!important.py` re-includes it despite the root `*.py` exclude...
+    assert any("vendor/sub/important.py" in f for f in code)
+    # ...while the root-excluded and non-re-included files stay out
+    assert not any(f.endswith("root.py") for f in code)
+    assert not any(f.endswith("other.py") for f in code)
+
+
+def test_nested_ignore_overrides_git_info_exclude_and_root(tmp_path):
+    """Precedence across all three sources: a nested `.gitignore` `!` re-include
+    outranks both a root `.gitignore` and `.git/info/exclude` (lowest, from
+    #1810), while an info/exclude-only file with no re-include stays out."""
+    (tmp_path / ".git" / "info").mkdir(parents=True)
+    (tmp_path / ".git" / "info" / "exclude").write_text("*.py\n")
+    (tmp_path / ".gitignore").write_text("keep.py\n")           # root also excludes it
+    sub = tmp_path / "a" / "b"
+    sub.mkdir(parents=True)
+    (sub / ".gitignore").write_text("!keep.py\n")               # nearest wins -> re-included
+    (sub / "keep.py").write_text("x = 1")
+    (tmp_path / "drop.py").write_text("y = 1")                  # only info/exclude -> excluded
+
+    result = detect(tmp_path)
+    code = result["files"]["code"]
+    assert any("a/b/keep.py" in f for f in code), "nested ! must beat root + info/exclude"
+    assert not any(f.endswith("drop.py") for f in code)
 
 
 def test_detect_handles_circular_symlinks(tmp_path):
@@ -467,14 +548,33 @@ def test_detect_skips_visual_tests_dir(tmp_path):
 
 
 def test_detect_skips_snapshots_dir(tmp_path):
-    """__snapshots__/ and snapshots/ are jest/vitest artefacts — must be excluded."""
+    """__snapshots__/ and real jest/vitest snapshots/ dirs are artefacts — excluded."""
     (tmp_path / "__snapshots__").mkdir()
     (tmp_path / "__snapshots__" / "app.test.ts.snap").write_text("// Jest Snapshot\nexports[`test 1`] = `<div/>`")
+    # a bare snapshots/ dir that actually holds .snap files is still a JS artefact
+    snap = tmp_path / "snapshots"
+    snap.mkdir()
+    (snap / "component.test.tsx.snap").write_text("exports[`renders`] = `<span/>`")
     (tmp_path / "app.ts").write_text("export function greet() { return 'hi'; }")
     result = detect(tmp_path)
     all_files = [f for files in result["files"].values() for f in files]
     assert not any("__snapshots__" in f for f in all_files)
+    assert not any(f"{os.sep}snapshots{os.sep}" in f for f in all_files)
     assert any("app.ts" in f for f in all_files)
+
+
+def test_detect_keeps_snapshots_code_namespace(tmp_path):
+    """#1666: a bare snapshots/ dir with no .snap files is a legit code namespace
+    (e.g. Rails app/services/snapshots/) and must NOT be pruned as a JS artefact."""
+    svc = tmp_path / "app" / "services" / "snapshots"
+    svc.mkdir(parents=True)
+    (svc / "round_reader.rb").write_text("class RoundReader\n  def call; end\nend\n")
+    (svc / "backfill_marker.rb").write_text("class BackfillMarker\n  def run; end\nend\n")
+    (tmp_path / "app.rb").write_text("class App; end\n")
+    result = detect(tmp_path)
+    all_files = [f for files in result["files"].values() for f in files]
+    assert any("round_reader.rb" in f for f in all_files)
+    assert any("backfill_marker.rb" in f for f in all_files)
 
 
 def test_detect_skips_storybook_static_dir(tmp_path):
@@ -515,6 +615,48 @@ def test_detect_skips_next_cache(tmp_path):
     all_files = [f for files in result["files"].values() for f in files]
     assert not any(".next" in f for f in all_files)
     assert any("index.tsx" in f for f in all_files)
+
+
+def test_detect_skips_nox_virtualenv(tmp_path):
+    """.nox/ (nox virtualenvs, tox's successor) must be excluded like .tox (#1804)."""
+    nox = tmp_path / ".nox" / "tests" / "lib" / "site-packages" / "pydeck"
+    nox.mkdir(parents=True)
+    (nox / "widget.py").write_text("class Deck: pass")
+    (tmp_path / "app.py").write_text("def go(): pass")
+    result = detect(tmp_path)
+    all_files = [f for files in result["files"].values() for f in files]
+    assert not any(".nox" in f for f in all_files)
+    assert any("app.py" in f for f in all_files)
+
+
+def test_detect_honors_git_info_exclude(tmp_path):
+    """.git/info/exclude (where `git worktree add` records nested worktree paths,
+    and where local-only excludes live) must be honored, not just .gitignore /
+    .graphifyignore — otherwise nested worktree copies get fully indexed (#1810)."""
+    (tmp_path / ".git" / "info").mkdir(parents=True)
+    (tmp_path / ".git" / "info" / "exclude").write_text("worktrees/\n")
+    wt = tmp_path / "worktrees" / "foo"
+    wt.mkdir(parents=True)
+    (wt / "dupe.py").write_text("def dupe(): pass")
+    (tmp_path / "real.py").write_text("def real(): pass")
+    result = detect(tmp_path)
+    all_files = [f for files in result["files"].values() for f in files]
+    assert not any("dupe.py" in f for f in all_files), "worktree dir was not excluded"
+    assert any("real.py" in f for f in all_files), "real source was dropped"
+
+
+def test_git_info_exclude_ranks_below_gitignore_negation(tmp_path):
+    """info/exclude is loaded at lowest priority, so a later .gitignore `!` negation
+    of the same (non-directory) pattern still wins under last-match-wins (#1810)."""
+    from graphify.detect import _load_graphifyignore, _is_ignored
+    (tmp_path / ".git" / "info").mkdir(parents=True)
+    (tmp_path / ".git" / "info" / "exclude").write_text("secret*.txt\n")
+    (tmp_path / ".gitignore").write_text("!secret-ok.txt\n")
+    (tmp_path / "secret-bad.txt").write_text("x")
+    (tmp_path / "secret-ok.txt").write_text("x")
+    patterns = _load_graphifyignore(tmp_path)
+    assert _is_ignored(tmp_path / "secret-bad.txt", tmp_path, patterns)
+    assert not _is_ignored(tmp_path / "secret-ok.txt", tmp_path, patterns)
 
 
 def test_detect_skips_graphify_own_cache(tmp_path):
@@ -810,9 +952,26 @@ def test_sensitive_does_not_flag_tokenizer_py():
 def test_sensitive_does_not_flag_tokenize_py():
     assert not _is_sensitive(Path("tokenize.py"))
 
-def test_sensitive_flags_passwords_py():
-    # passwords.py is just as likely a secret store as passwords.txt — code ext is no excuse
-    assert _is_sensitive(Path("passwords.py"))
+def test_sensitive_does_not_flag_passwords_py():
+    # #1666: a programming-language source file named after a domain noun is a
+    # module, not a secret store. Silently dropping it hid real code from the graph.
+    # Genuine secret stores are .env/.pem/credentials.json etc. (still flagged below).
+    assert not _is_sensitive(Path("passwords.py"))
+
+
+def test_sensitive_does_not_flag_ruby_code_modules():
+    # #1666 exact cases: Rails source modules with keyword-ish names must survive.
+    assert not _is_sensitive(Path("app/models/device_token.rb"))
+    assert not _is_sensitive(Path("app/controllers/api/v1/passwords_controller.rb"))
+
+
+def test_sensitive_still_flags_data_secret_stores():
+    # #1666 guard: the exemption is ONLY for real source code, not data/config
+    # formats — credentials.json / oauth_token.json / secrets.yaml are the secret
+    # stores Stage 3 must keep catching (even though .json routes through CODE).
+    assert _is_sensitive(Path("credentials.json"))
+    assert _is_sensitive(Path("oauth_token.json"))
+    assert _is_sensitive(Path("app_secret.yaml"))
 
 def test_sensitive_flags_ssh_dir():
     assert _is_sensitive(Path("/home/user/.ssh/id_rsa"))
@@ -1538,3 +1697,60 @@ def test_convert_office_file_does_not_rewrite_existing_sidecar(tmp_path, monkeyp
     second = detect_mod.convert_office_file(src, out_dir)
     assert second == first
     assert second.stat().st_mtime_ns == mtime_before
+
+
+def test_detect_records_unclassified_extensionless_files(tmp_path):
+    # #1692: extensionless, non-shebang project files (Dockerfile, Makefile, ...)
+    # were considered but left no trace. detect() now lists them under
+    # "unclassified" so they can be surfaced instead of silently vanishing.
+    (tmp_path / "app.py").write_text("def f():\n    return 1\n")
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12\nRUN pip install x\n")
+    (tmp_path / "Makefile").write_text("build:\n\techo hi\n")
+    (tmp_path / "LICENSE").write_text("MIT License\n")
+    res = detect(tmp_path)
+    unclassified = sorted(Path(p).name for p in res.get("unclassified", []))
+    assert unclassified == ["Dockerfile", "LICENSE", "Makefile"]
+    # real code is still classified, not swept into unclassified
+    assert any("app.py" in f for f in res["files"].get("code", []))
+
+
+def test_detect_unclassified_empty_when_all_supported(tmp_path):
+    (tmp_path / "a.py").write_text("x = 1\n")
+    (tmp_path / "README.md").write_text("# hi\n")
+    res = detect(tmp_path)
+    assert res.get("unclassified", []) == []
+
+
+def test_detect_reports_walk_errors_key():
+    """detect() always surfaces a walk_errors list so callers can tell whether
+    enumeration was complete."""
+    import tempfile
+    d = Path(tempfile.mkdtemp())
+    (d / "a.py").write_text("def f(): pass\n")
+    res = detect(d)
+    assert "walk_errors" in res
+    assert res["walk_errors"] == []
+
+
+def test_detect_surfaces_unreadable_dir_instead_of_silent_skip(tmp_path, capsys):
+    """os.walk silently skips a subtree whose scandir raises (permissions, or a
+    dir deleted mid-walk); that under-enumeration used to be invisible and could
+    yield a silently partial graph. detect() now records it in walk_errors and
+    warns, while still enumerating the rest of the tree."""
+    import os
+    if os.geteuid() == 0:
+        import pytest
+        pytest.skip("running as root: chmod 000 does not block scandir")
+    (tmp_path / "a.py").write_text("def f(): pass\n")
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    (locked / "b.py").write_text("def g(): pass\n")
+    os.chmod(locked, 0o000)
+    try:
+        res = detect(tmp_path)
+    finally:
+        os.chmod(locked, 0o755)  # restore for cleanup
+    code = res["files"]["code"]
+    assert any(f.endswith("a.py") for f in code)  # rest of tree still enumerated
+    assert len(res["walk_errors"]) >= 1
+    assert "could not scan" in capsys.readouterr().err

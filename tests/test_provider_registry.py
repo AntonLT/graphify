@@ -159,6 +159,7 @@ def test_detect_backend_custom_provider_after_builtins(monkeypatch):
     monkeypatch.delenv("AWS_PROFILE", raising=False)
     monkeypatch.delenv("AWS_REGION", raising=False)
     monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    monkeypatch.setattr("shutil.which", lambda name: None)
 
     result = llm.detect_backend()
     assert result == "myprovider"

@@ -407,6 +407,7 @@ def _reconcile_existing_graph(
             source_paths.absolute_identity(str(path), project_root) for path in extract_targets
         }
         node_evicted_source_identities = set(deleted_source_identities)
+        hyperedge_evicted_source_identities = set(deleted_source_identities)
         if not full_rebuild:
             node_evicted_source_identities.update(rebuilt_source_identities)
         edge_evicted_source_identities = (
@@ -417,6 +418,17 @@ def _reconcile_existing_graph(
         # lists can contain only a rename destination, so explicit paths alone
         # cannot identify the stale source. Keep the comparison scoped to the
         # watched root so subfolder updates preserve records outside that subtree.
+        #
+        # Fail-closed eviction: a source identity missing from the corpus is only
+        # DELETION evidence when the file is actually gone from disk. A file that
+        # still exists but stopped being collected was *excluded* (ignore rules or
+        # filters changed — e.g. a .gitignore the scanner newly honors), and
+        # treating that as deletion silently mass-evicts good nodes. Preserve
+        # instead and say so; a full re-extraction still purges deliberately
+        # excluded sources via the AST ownership rule below.
+        excluded_alive_files: set[str] = set()
+        excluded_alive_nodes = 0
+        _alive_cache: dict[str, bool] = {}
         for node in existing.get("nodes", []):
             source_file = node.get("source_file")
             if not source_file or _get_extractor(Path(source_file)) is None:
@@ -425,12 +437,29 @@ def _reconcile_existing_graph(
             if not source_paths.in_watch_root(source_file):
                 continue
             if identity not in current_sources:
+                if identity:
+                    alive = _alive_cache.get(identity)
+                    if alive is None:
+                        alive = Path(identity).exists()
+                        _alive_cache[identity] = alive
+                    if alive:
+                        excluded_alive_files.add(identity)
+                        excluded_alive_nodes += 1
+                        continue
                 normalized = source_paths.normalize(source_file)
                 if normalized:
                     deleted_paths.add(normalized)
                 if identity:
                     node_evicted_source_identities.add(identity)
                     edge_evicted_source_identities.add(identity)
+                    hyperedge_evicted_source_identities.add(identity)
+        if excluded_alive_files:
+            print(
+                f"[graphify watch] fail-closed: kept {excluded_alive_nodes} node(s) "
+                f"from {len(excluded_alive_files)} file(s) that left the scan corpus "
+                "but still exist on disk (ignore rules or filters changed?). "
+                "Run a full re-extraction to purge them if the exclusion is intentional."
+            )
 
         # A full re-extraction owns every AST node under watch_root. Incremental
         # extraction owns only nodes from rebuilt or deleted sources. Semantic
@@ -473,7 +502,7 @@ def _reconcile_existing_graph(
         for edge in existing.get("hyperedges", []):
             members = edge.get("nodes", edge.get("members", edge.get("node_ids", [])))
             if edge.get("id") in new_hyperedge_ids or source_paths.is_evicted(
-                edge, edge_evicted_source_identities
+                edge, hyperedge_evicted_source_identities
             ):
                 continue
             if isinstance(members, list) and any(member not in all_ids for member in members):
@@ -537,6 +566,7 @@ def _canonical_topology_for_compare(graph_data: dict) -> dict:
                 continue
             n = dict(node)
             n.pop("community", None)
+            n.pop("community_name", None)
             n.pop("norm_label", None)
             norm_nodes.append(n)
         canonical["nodes"] = sorted(
@@ -657,6 +687,37 @@ def _json_text(data: dict) -> str:
     return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
 
 
+def _stabilize_rebuild_cwd(watch_path: Path) -> bool:
+    """Ensure relative rebuild paths have a usable CWD before queue/lock setup.
+
+    Detached git hooks can inherit a transient working directory that is deleted
+    before the background rebuild starts. In that state Path.cwd(),
+    Path('.').resolve(), and relative graphify-out mkdirs raise FileNotFoundError
+    before the normal rebuild error handling can run. Hooks that know the repo
+    root export GRAPHIFY_REPO_ROOT so the rebuild can recover by chdir'ing there.
+    """
+    if watch_path.is_absolute():
+        return True
+
+    repo_root = os.environ.get("GRAPHIFY_REPO_ROOT", "").strip()
+    if repo_root and Path(repo_root).is_dir():
+        try:
+            os.chdir(repo_root)
+            return True
+        except OSError:
+            pass
+
+    try:
+        Path.cwd()
+        return True
+    except FileNotFoundError:
+        print(
+            "[graphify watch] Rebuild failed: current working directory "
+            "no longer exists and GRAPHIFY_REPO_ROOT is not set."
+        )
+        return False
+
+
 def _rebuild_code(
     watch_path: Path,
     *,
@@ -690,6 +751,9 @@ def _rebuild_code(
 
     Returns True on success, False on error or skipped-due-to-lock.
     """
+    if not _stabilize_rebuild_cwd(watch_path):
+        return False
+
     out = watch_path / _GRAPHIFY_OUT
     if acquire_lock:
         # #1059: incremental (changed_paths is not None) hooks must not drop
@@ -980,7 +1044,7 @@ def _rebuild_code(
         report_path = out / "GRAPH_REPORT.md"
         labels_json = json.dumps({str(k): v for k, v in sorted(labels.items())}, ensure_ascii=False, indent=2) + "\n"
         graph_tmp = out / ".graph.tmp.json"
-        json_written = to_json(G, communities, str(graph_tmp), force=True, built_at_commit=commit)
+        json_written = to_json(G, communities, str(graph_tmp), force=True, built_at_commit=commit, community_labels=labels)
         if not json_written:
             return False
         candidate_graph_data = json.loads(graph_tmp.read_text(encoding="utf-8"))

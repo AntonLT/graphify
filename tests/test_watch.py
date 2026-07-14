@@ -160,6 +160,34 @@ def test_graphify_root_preserves_relative_when_invoked_with_relative_path(tmp_pa
     )
 
 
+def test_rebuild_code_writes_community_name(tmp_path):
+    """#1808: `graphify update` / _rebuild_code must forward community_labels to
+    to_json, so graph.json nodes carry a human-readable community_name (hub-derived
+    for a code-only rebuild) — not just a numeric community id. Before the fix,
+    _rebuild_code called to_json without community_labels, so the labels a
+    cluster-only pass writes were stripped again on every incremental rebuild."""
+    import json
+    from graphify.watch import _rebuild_code
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "a.py").write_text(
+        "def alpha():\n    return beta()\n\ndef beta():\n    return 1\n", encoding="utf-8"
+    )
+    (corpus / "b.py").write_text(
+        "import a\n\ndef gamma():\n    return a.alpha()\n", encoding="utf-8"
+    )
+    assert _rebuild_code(corpus, acquire_lock=False) is True
+
+    graph = json.loads((corpus / "graphify-out" / "graph.json").read_text(encoding="utf-8"))
+    clustered = [n for n in graph["nodes"] if n.get("community") is not None]
+    assert clustered, "expected clustered nodes in the rebuilt graph"
+    assert all(n.get("community_name") for n in clustered), (
+        "clustered nodes missing community_name — the update rebuild stripped the "
+        "labels that cluster-only writes (#1808)"
+    )
+
+
 def test_graphify_root_preserves_absolute_when_user_supplied(tmp_path):
     """When the caller supplies an absolute path, ``.graphify_root`` stores
     that absolute form verbatim — preserving explicit-absolute intent."""
@@ -174,6 +202,56 @@ def test_graphify_root_preserves_absolute_when_user_supplied(tmp_path):
     assert saved == str(corpus), (
         f"absolute caller path must be preserved as-is; got {saved!r}"
     )
+
+
+def test_rebuild_code_deleted_cwd_without_repo_root_returns_false(tmp_path, monkeypatch, capsys):
+    """Detached hooks can inherit a CWD that no longer exists.
+
+    Without GRAPHIFY_REPO_ROOT, the rebuild should fail cleanly before creating
+    relative graphify-out queue/lock files.
+    """
+    from graphify.watch import _rebuild_code
+
+    old_cwd = Path.cwd()
+    gone = tmp_path / "gone"
+    gone.mkdir()
+    monkeypatch.delenv("GRAPHIFY_REPO_ROOT", raising=False)
+
+    os.chdir(gone)
+    gone.rmdir()
+    try:
+        assert _rebuild_code(Path("."), changed_paths=[Path("lib.py")]) is False
+    finally:
+        os.chdir(old_cwd)
+
+    out = capsys.readouterr().out
+    assert "current working directory no longer exists" in out
+
+
+def test_rebuild_code_deleted_cwd_uses_graphify_repo_root(tmp_path, monkeypatch):
+    """GRAPHIFY_REPO_ROOT lets detached hook rebuilds recover from a deleted CWD."""
+    from graphify.watch import _rebuild_code
+
+    old_cwd = Path.cwd()
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "lib.py").write_text("def f(): pass\n", encoding="utf-8")
+    gone = tmp_path / "gone"
+    gone.mkdir()
+    monkeypatch.setenv("GRAPHIFY_REPO_ROOT", str(corpus))
+
+    os.chdir(gone)
+    gone.rmdir()
+    try:
+        assert _rebuild_code(
+            Path("."),
+            changed_paths=[Path("lib.py")],
+            no_cluster=True,
+        ) is True
+        assert Path.cwd().resolve() == corpus.resolve()
+        assert (corpus / "graphify-out" / "graph.json").exists()
+    finally:
+        os.chdir(old_cwd)
 
 
 def test_rebuild_code_evicts_nodes_from_deleted_files(tmp_path):
@@ -224,6 +302,57 @@ def _add_unrelated_semantic_pair(graph_path):
         "nodes": ["docs_topic", "shared_concept"],
     }]
     graph_path.write_text(json.dumps(data), encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "changed_paths",
+    [None, [Path("doc.md")]],
+    ids=["full-update", "incremental-doc-update"],
+)
+def test_rebuild_code_preserves_hyperedges_for_rebuilt_surviving_source(
+    tmp_path, changed_paths
+):
+    """#1755: AST-only updates must not drop semantic hyperedges whose members survive."""
+    from graphify.watch import _rebuild_code
+
+    corpus = tmp_path / "corpus"
+    corpus.mkdir()
+    (corpus / "doc.md").write_text(
+        "# Design\n\n## Flow\n\nDetails.\n", encoding="utf-8"
+    )
+
+    assert _rebuild_code(corpus, no_cluster=True, acquire_lock=False) is True
+    graph_path = corpus / "graphify-out" / "graph.json"
+    data = json.loads(graph_path.read_text(encoding="utf-8"))
+    assert {"doc", "doc_design"} <= {node["id"] for node in data["nodes"]}
+    data["hyperedges"] = [{
+        "id": "doc_flow_group",
+        "label": "Doc flow group",
+        "nodes": ["doc", "doc_design"],
+        "relation": "implements",
+        "confidence": "EXTRACTED",
+        "confidence_score": 1.0,
+        "source_file": "doc.md",
+    }]
+    graph_path.write_text(json.dumps(data), encoding="utf-8")
+
+    assert _rebuild_code(
+        corpus,
+        changed_paths=changed_paths,
+        no_cluster=True,
+        acquire_lock=False,
+    ) is True
+
+    after = json.loads(graph_path.read_text(encoding="utf-8"))
+    assert after["hyperedges"] == [{
+        "id": "doc_flow_group",
+        "label": "Doc flow group",
+        "nodes": ["doc", "doc_design"],
+        "relation": "implements",
+        "confidence": "EXTRACTED",
+        "confidence_score": 1.0,
+        "source_file": "doc.md",
+    }]
 
 
 @pytest.mark.parametrize(
@@ -1309,3 +1438,59 @@ def test_merge_changed_paths_dedupes_in_order():
         [Path("a.py")],
     )
     assert [p.as_posix() for p in merged] == ["a.py", "b.py", "c.py"]
+
+
+def test_rebuild_code_preserves_nodes_from_excluded_but_alive_file(tmp_path, capsys):
+    """Fail-closed eviction: a file that leaves the scan corpus (newly ignored)
+    but still exists on disk was EXCLUDED, not deleted — its nodes must survive
+    an incremental rebuild, with a loud message, instead of being silently
+    mass-evicted as stale sources (the docs/brainstorms incident: an upgrade
+    started honoring .gitignore and evicted 655 nodes whose files were present).
+    """
+    import json
+    from graphify.watch import _rebuild_code
+
+    corpus = tmp_path / "corpus"
+    (corpus / "notes").mkdir(parents=True)
+    (corpus / "auth.py").write_text("def login(): pass\n", encoding="utf-8")
+    (corpus / "notes" / "brainstorm.md").write_text(
+        "# Brainstorm\n\nA local-only design note.\n", encoding="utf-8"
+    )
+
+    assert _rebuild_code(corpus, acquire_lock=False) is True
+    graph_path = corpus / "graphify-out" / "graph.json"
+    labels = {n["label"] for n in json.loads(graph_path.read_text(encoding="utf-8"))["nodes"]}
+    assert "brainstorm.md" in labels
+
+    # The file becomes ignored (leaves the corpus) but stays on disk.
+    (corpus / ".graphifyignore").write_text("notes/\n", encoding="utf-8")
+    capsys.readouterr()
+
+    assert _rebuild_code(corpus, changed_paths=[Path("auth.py")], acquire_lock=False) is True
+    labels = {n["label"] for n in json.loads(graph_path.read_text(encoding="utf-8"))["nodes"]}
+    assert "brainstorm.md" in labels, (
+        "nodes from an excluded-but-alive file must be preserved, not evicted"
+    )
+    assert "fail-closed: kept" in capsys.readouterr().out
+
+
+def test_rebuild_code_still_evicts_when_excluded_file_is_also_deleted(tmp_path):
+    """The fail-closed preserve must not weaken true-deletion eviction: once the
+    excluded file is actually gone from disk, its nodes are evicted as before."""
+    import json
+    from graphify.watch import _rebuild_code
+
+    corpus = tmp_path / "corpus"
+    (corpus / "notes").mkdir(parents=True)
+    (corpus / "auth.py").write_text("def login(): pass\n", encoding="utf-8")
+    (corpus / "notes" / "brainstorm.md").write_text("# Brainstorm\n", encoding="utf-8")
+
+    assert _rebuild_code(corpus, acquire_lock=False) is True
+    graph_path = corpus / "graphify-out" / "graph.json"
+
+    (corpus / "notes" / "brainstorm.md").unlink()
+
+    assert _rebuild_code(corpus, changed_paths=[Path("auth.py")], acquire_lock=False) is True
+    labels = {n["label"] for n in json.loads(graph_path.read_text(encoding="utf-8"))["nodes"]}
+    assert "brainstorm.md" not in labels, "deleted file's nodes must still be evicted"
+    assert "login()" in labels

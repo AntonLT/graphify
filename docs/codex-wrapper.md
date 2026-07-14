@@ -5,11 +5,11 @@ published `graphifyy` package release.
 
 ## Baseline
 
-- Upstream: `https://github.com/Graphify-Labs/graphify`
+- Upstream: `https://github.com/safishamsi/graphify`
 - Fork: `https://github.com/AntonLT/graphify`
 - Branch: `anton/codex-graphify-wrapper`
 - Original preserved baseline: `v0.8.49`
-- Current package baseline: `v0.9.6`
+- Current package baseline: `v0.9.15`
 - Installed command: `/Users/anton/.local/bin/graphify`
 - Installed package env:
   `/Users/anton/.local/share/uv/tools/graphifyy`

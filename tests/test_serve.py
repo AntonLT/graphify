@@ -8,6 +8,8 @@ from graphify.serve import (
     _communities_from_graph,
     _score_nodes,
     _compute_idf,
+    _EXACT_MATCH_BONUS,
+    _SOURCE_MATCH_BONUS,
     _pick_seeds,
     _bfs,
     _dfs,
@@ -123,6 +125,66 @@ def test_score_nodes_multiword_exact_label_outranks_superset():
     assert scored[0][0] > scored[1][0], "exact label must strictly outrank superset/token-bag matches"
 
 
+def test_score_nodes_coverage_lone_generic_exact_hit_loses_to_multi_term_match():
+    """A lone generic-word exact match must not bury a multi-term match.
+
+    Reproduces #1602: in a multi-term query, a single generic term that
+    exactly equals a short leaf label (query term "list" vs a list() function
+    node) received the full exact-tier bonus and outranked every node matching
+    several of the query's terms, even when the query contained the target's
+    literal identifier. The per-term exact/prefix tiers are now scaled by
+    squared term coverage, so a 1-of-5-terms collision drops below a
+    multi-term match. The leaves live in the same directory as the target
+    (the realistic case) to pin that source-path hits do not count as
+    coverage and hand the collision its exact tier back.
+    """
+    G = nx.Graph()
+
+    def _add(nid, label, src):
+        G.add_node(nid, label=label, norm_label=label.lower(),
+                   source_file=src, community=0)
+
+    _add("target", "ClientLive.Index", "lib/clients_live/index.ex")
+    _add("form", "ClientLive.Form", "lib/clients_live/form.ex")
+    _add("show", "ClientLive.Show", "lib/clients_live/show.ex")
+    # Same-named tiny leaf functions: "list" == bare label fires the exact
+    # tier. Placed in the target's own directory so their source paths also
+    # substring-match the query term "clients": a path hit must not inflate
+    # the coverage that multiplies the exact tier.
+    for i in range(3):
+        _add(f"leaf{i}", "list()", f"lib/clients_live/helpers{i}.ex")
+    # Filler making "list" a common (low-IDF) token, as in a real graph where
+    # list()/get()/new() style names are ubiquitous.
+    for i in range(24):
+        _add(f"filler{i}", f"shopping list {i}", f"lib/filler{i}.ex")
+
+    # The user pastes the real identifier plus context words; tokenization
+    # yields 5 terms: clientlive, index, clients, list, columns.
+    scored = _score_nodes(G, [t.lower() for t in "ClientLive.Index clients list columns".split()])
+    by_id = {nid: s for s, nid in scored}
+
+    assert scored[0][1] == "target"
+    assert by_id["target"] > by_id["leaf0"], (
+        "a 1-of-5-terms exact collision must not outrank the node matching 3 of 5 terms"
+    )
+
+
+def test_score_nodes_coverage_full_coverage_query_is_unchanged():
+    """Coverage scaling must not touch full-coverage queries (coverage == 1).
+
+    A single-term identifier lookup keeps the exact tier's full magnitude, so
+    `query "FooBarService"` behavior is byte-identical to before #1602.
+    """
+    G = _make_graph()
+    scored = _score_nodes(G, ["extract"])
+    w = _compute_idf(G, ["extract"])["extract"]
+    assert scored[0][1] == "n1"
+    # Full-query exact tier (10x) + per-term exact tier + source hit
+    # ("extract" in "extract.py"), all undampened.
+    expected = (_EXACT_MATCH_BONUS * 10 + _EXACT_MATCH_BONUS + _SOURCE_MATCH_BONUS) * w
+    assert scored[0][0] == pytest.approx(expected)
+
+
 def test_find_node_ignores_trailing_punctuation():
     G = _make_graph()
     assert _find_node(G, "extract?") == ["n1"]
@@ -133,6 +195,30 @@ def test_find_node_matches_full_punctuated_unicode_label():
     G.add_node("n1", label="Skill /auditar — Auditoría inquisitiva de enlaces")
 
     assert _find_node(G, "Skill /auditar — Auditoría inquisitiva de enlaces") == ["n1"]
+
+
+def test_find_node_matches_punctuated_file_label_exactly():
+    # #1704: an exactly-typed punctuated file label must resolve through explain,
+    # just like it does through path/query.
+    G = nx.Graph()
+    G.add_node("f1", label="blockStream.ts", norm_label="blockstream.ts",
+               source_file="lib/blockStream.ts", source_location="L1")
+    G.add_node("f2", label="blockStream.test.ts", norm_label="blockstream.test.ts",
+               source_file="lib/blockStream.test.ts", source_location="L1")
+    assert _find_node(G, "blockStream.ts")[0] == "f1"
+    assert _find_node(G, "blockStream.test.ts")[0] == "f2"
+
+
+def test_find_node_resolves_when_label_and_norm_label_diverge():
+    # #1704 hardening: the tokenized-label tier only rescues the match by
+    # coincidence (label tokenizes the same as the query). When `label` and
+    # `norm_label` diverge, only the symmetric `norm_query == norm_label` match
+    # resolves it. Here label tokenizes to "blockstream" but norm_label is
+    # "blockstream.ts" — this fails without the norm_query path.
+    G = nx.Graph()
+    G.add_node("n1", label="BlockStream", norm_label="blockstream.ts",
+               source_file="lib/x.ts", source_location="L1")
+    assert _find_node(G, "blockStream.ts") == ["n1"]
 
 
 # --- trigram candidate prefilter (the trigram index that shrinks the O(N) scan) ---
@@ -681,6 +767,65 @@ def test_pick_seeds_diversity_recovers_starved_term(monkeypatch):
     seeds_after = _pick_seeds(scored, G=G, terms=terms)
     assert "noise" in seeds_after
     assert "target" in seeds_after
+
+
+# --- generic-symbol seed flooding (#1766) ---
+
+def test_pick_seeds_dedups_homonymous_generic_labels():
+    """Many nodes sharing one generic label (e.g. framework `GET` handlers)
+    must contribute at most ONE seed, not consume every slot (#1766). A
+    distinct, relevant label still gets its own seed."""
+    G = nx.DiGraph()
+    for i in range(5):
+        G.add_node(f"get{i}", label="GET", source_file=f"routes/r{i}.py")
+    G.add_node("um", label="users_model", source_file="models/users.py")
+    # Score all the GET nodes above users_model so, pre-fix, they'd take every slot.
+    scored = [(1000.0, f"get{i}") for i in range(5)] + [(900.0, "um")]
+    seeds = _pick_seeds(scored, G=G)
+    get_seeds = [s for s in seeds if s.startswith("get")]
+    assert len(get_seeds) == 1, f"expected one GET representative, got {get_seeds}"
+    # A different, well-within-gap label is not starved out by the GET flood.
+    assert "um" in seeds
+
+
+def test_pick_seeds_dedup_key_is_case_and_diacritic_normalized():
+    """`GET`/`Get`/`get` are the same generic label and must dedup together."""
+    G = nx.DiGraph()
+    G.add_node("a", label="GET", source_file="a.py")
+    G.add_node("b", label="Get", source_file="b.py")
+    G.add_node("c", label="get", source_file="c.py")
+    scored = [(1000.0, "a"), (990.0, "b"), (980.0, "c")]
+    seeds = _pick_seeds(scored, G=G)
+    assert len(seeds) == 1, f"case-variant duplicates not collapsed: {seeds}"
+
+
+def test_pick_seeds_per_term_guarantee_does_not_reintroduce_generic_dupe(monkeypatch):
+    """The per-term guarantee loop must honor the same per-label cap, so it can't
+    add a second `GET` after dedup already seeded one (#1766)."""
+    G = nx.DiGraph()
+    for i in range(3):
+        G.add_node(f"get{i}", label="GET", source_file=f"r{i}.py")
+    G.add_node("um", label="users_model", source_file="users.py")
+    G.add_edge("um", "get0")
+    scored = _score_nodes(G, ["get", "users"])
+    seeds = _pick_seeds(scored, G=G, terms=["get", "users"])
+    get_seeds = [s for s in seeds if s.startswith("get")]
+    assert len(get_seeds) == 1, f"per-term guarantee reintroduced a GET dupe: {seeds}"
+
+
+def test_score_nodes_scores_identical_labels_equally():
+    """Guard against a per-label multiplicity penalty leaking into _score_nodes
+    (shared by shortest_path / explain endpoint resolution): two nodes with the
+    SAME label must receive the SAME score for a query, i.e. the fix lives in
+    seed selection, not in the shared scorer (#1766 followup)."""
+    G = nx.DiGraph()
+    G.add_node("g1", label="GET", source_file="a.py")
+    G.add_node("g2", label="GET", source_file="b.py")
+    G.add_node("g3", label="GET", source_file="c.py")
+    by_id = {nid: s for s, nid in _score_nodes(G, ["get"])}
+    assert by_id["g1"] == by_id["g2"] == by_id["g3"], (
+        f"identical-label nodes scored differently: {by_id}"
+    )
 
 
 # --- actionable truncation hint (#897) ---

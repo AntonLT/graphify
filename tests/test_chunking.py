@@ -118,7 +118,9 @@ def test_estimate_file_tokens_uses_tiktoken_when_available(tmp_path):
 
     # Force the tokenizer to be a mock that records calls and returns a known
     # token list, so we can assert the tiktoken path is taken.
-    fake_encoder = type("E", (), {"encode": staticmethod(lambda s: [0] * 999)})()
+    # Match tiktoken's real signature: encode(text, *, disallowed_special=...)
+    # so the #1685 hardening call (disallowed_special=()) reaches the mock.
+    fake_encoder = type("E", (), {"encode": staticmethod(lambda s, **kw: [0] * 999)})()
     with patch.object(llm, "_TOKENIZER", fake_encoder):
         n = llm._estimate_file_tokens(f)
     assert n == 999 + (llm._PER_FILE_OVERHEAD_CHARS // llm._CHARS_PER_TOKEN)
@@ -275,6 +277,53 @@ def test_corpus_parallel_continues_after_chunk_failure(tmp_path, capsys):
     assert len(result["nodes"]) == 3
     err = capsys.readouterr().err
     assert "failed" in err and "simulated API error" in err
+
+
+def test_checkpoint_scopes_cache_writes_to_chunk_files(tmp_path):
+    """#1757: the per-chunk incremental checkpoint must not let a chunk's
+    mis-attributed node clobber another corpus file's semantic cache. A chunk
+    processing only A.py that returns a node attributed to B.py must leave B.py's
+    existing cache entry untouched. Guards the call site the original fix missed."""
+    from graphify.llm import extract_corpus_parallel
+    from graphify.cache import save_semantic_cache, load_cached
+
+    a = tmp_path / "A.py"; a.write_text("def a(): pass")
+    b = tmp_path / "B.py"; b.write_text("def b(): pass")
+
+    # Seed B.py's legitimate semantic cache (a full, correct entry).
+    save_semantic_cache(
+        [{"id": "b_real", "source_file": "B.py", "file_type": "code"}],
+        [], [], root=tmp_path,
+    )
+    before = load_cached(b, tmp_path, kind="semantic")
+    assert before and [n["id"] for n in before["nodes"]] == ["b_real"]
+
+    # The chunk dispatches only A.py, but the (untrusted) model result attributes
+    # a stray node to B.py — the #1757 mis-attribution.
+    def stray(chunk, **kwargs):
+        return {
+            "nodes": [
+                {"id": "a_ok", "source_file": "A.py", "file_type": "code"},
+                {"id": "b_stray", "source_file": "B.py", "file_type": "code"},
+            ],
+            "edges": [], "hyperedges": [],
+            "input_tokens": 1, "output_tokens": 1,
+        }
+
+    with patch("graphify.llm.extract_files_direct", side_effect=stray):
+        extract_corpus_parallel(
+            [a], backend="kimi", root=tmp_path,
+            token_budget=None, chunk_size=1, max_concurrency=1,
+        )
+
+    # B.py's cache is unchanged: the stray node was rejected, not merged in.
+    after = load_cached(b, tmp_path, kind="semantic")
+    assert [n["id"] for n in after["nodes"]] == ["b_real"], (
+        f"B.py cache was clobbered by an out-of-chunk node: {after}"
+    )
+    # A.py (the actual chunk file) was legitimately cached.
+    a_cache = load_cached(a, tmp_path, kind="semantic")
+    assert a_cache and any(n["id"] == "a_ok" for n in a_cache["nodes"])
 
 
 def test_corpus_parallel_legacy_mode_when_token_budget_is_none(tmp_path):
@@ -497,3 +546,30 @@ def test_corpus_parallel_uses_adaptive_retry(tmp_path):
     assert len(chunk_done_args) == 1
     assert chunk_done_args[0] == (0, 1, 4)
     assert len(result["nodes"]) == 4
+
+
+# ---- #1685: special-token strings in docs must not crash token estimation ----
+
+def test_estimate_file_tokens_handles_tiktoken_special_token(tmp_path):
+    """A doc containing a literal tiktoken special token (e.g. <|endoftext|>)
+    must not crash token estimation. tiktoken's default encode() raises on such
+    strings appearing as ordinary text; we pass disallowed_special=() since this
+    is only an estimate (#1685)."""
+    import graphify.llm as llm
+    if llm._TOKENIZER is None:
+        import pytest
+        pytest.skip("tiktoken not installed; estimation uses the char heuristic")
+    f = tmp_path / "tokenizer-notes.md"
+    f.write_text("The GPT end-of-text token is <|endoftext|> in the vocab.\n")
+    n = llm._estimate_file_tokens(f)  # must not raise
+    assert isinstance(n, int) and n > 0
+
+
+def test_pack_chunks_with_special_token_doc_does_not_crash(tmp_path):
+    """End to end: packing a corpus that includes a special-token doc must not
+    raise (the crash in #1685 happened during token-budget packing)."""
+    from graphify.llm import _pack_chunks_by_tokens
+    doc = tmp_path / "doc.md"; doc.write_text("see <|endoftext|> and <|im_start|> tokens\n")
+    code = tmp_path / "code.py"; code.write_text("def f():\n    return 1\n")
+    chunks = _pack_chunks_by_tokens([doc, code], token_budget=60_000)
+    assert chunks  # produced at least one chunk, no exception
