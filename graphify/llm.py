@@ -1334,6 +1334,11 @@ def _run_codex_cli_prompt(prompt: str, *, model: str | None = None, images: list
     try:
         cli_args = [
             "codex", "exec",
+            "--ephemeral",
+            "--skip-git-repo-check",
+            "--ignore-rules",
+            "--sandbox", "read-only",
+            "--cd", tempfile.gettempdir(),
             "--model", model,
             "-c", f'model_reasoning_effort="{reasoning}"',
             "--output-last-message", out_path,

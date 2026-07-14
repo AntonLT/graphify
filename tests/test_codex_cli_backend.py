@@ -77,6 +77,11 @@ def test_call_codex_cli_passes_default_model_and_reasoning(monkeypatch):
 
     argv = run.call_args.args[0]
     assert argv[:2] == ["codex", "exec"]
+    assert "--ephemeral" in argv
+    assert "--skip-git-repo-check" in argv
+    assert "--ignore-rules" in argv
+    assert argv[argv.index("--sandbox") + 1] == "read-only"
+    assert argv[argv.index("--cd") + 1]
     assert argv[argv.index("--model") + 1] == "gpt-5.3-codex-spark"
     assert "model_reasoning_effort=\"xhigh\"" in argv
     assert "--output-last-message" in argv

@@ -23,6 +23,8 @@ _LLM_ENV_KEYS = (
 
 def _run(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
     env = {k: v for k, v in os.environ.items() if k not in _LLM_ENV_KEYS}
+    # Keep the no-backend assertions independent of an installed codex CLI.
+    env["PATH"] = ""
     return subprocess.run(
         [PYTHON, "-m", "graphify"] + args,
         cwd=cwd,
