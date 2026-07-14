@@ -2014,9 +2014,9 @@ def extract_corpus_parallel(
             # (#1757). The model can attribute a node's source_file to another
             # corpus file; without this bound, that stray node would clobber the
             # other file's complete cache entry (or, with merge_existing, pollute
-            # it). A FileSlice reports its file via `.rel`; a bare Path is the
+            # it). A FileSlice reports its file via `.path`; a bare Path is the
             # relative source_file itself.
-            allowed = [getattr(item, "rel", None) or item for item in chunk]
+            allowed = [getattr(item, "path", item) for item in chunk]
             _scs(
                 result.get("nodes", []),
                 result.get("edges", []),

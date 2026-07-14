@@ -284,15 +284,15 @@ def test_checkpoint_scopes_cache_writes_to_chunk_files(tmp_path):
     mis-attributed node clobber another corpus file's semantic cache. A chunk
     processing only A.py that returns a node attributed to B.py must leave B.py's
     existing cache entry untouched. Guards the call site the original fix missed."""
-    from graphify.llm import extract_corpus_parallel
+    from graphify.llm import extract_corpus_parallel, _FILE_CHAR_CAP
     from graphify.cache import save_semantic_cache, load_cached
 
-    a = tmp_path / "A.py"; a.write_text("def a(): pass")
-    b = tmp_path / "B.py"; b.write_text("def b(): pass")
+    a = tmp_path / "A.md"; a.write_text("x" * (_FILE_CHAR_CAP + 1))
+    b = tmp_path / "B.md"; b.write_text("# B\n")
 
     # Seed B.py's legitimate semantic cache (a full, correct entry).
     save_semantic_cache(
-        [{"id": "b_real", "source_file": "B.py", "file_type": "code"}],
+        [{"id": "b_real", "source_file": "B.md", "file_type": "document"}],
         [], [], root=tmp_path,
     )
     before = load_cached(b, tmp_path, kind="semantic")
@@ -303,8 +303,8 @@ def test_checkpoint_scopes_cache_writes_to_chunk_files(tmp_path):
     def stray(chunk, **kwargs):
         return {
             "nodes": [
-                {"id": "a_ok", "source_file": "A.py", "file_type": "code"},
-                {"id": "b_stray", "source_file": "B.py", "file_type": "code"},
+                    {"id": "a_ok", "source_file": "A.md", "file_type": "document"},
+                    {"id": "b_stray", "source_file": "B.md", "file_type": "document"},
             ],
             "edges": [], "hyperedges": [],
             "input_tokens": 1, "output_tokens": 1,
